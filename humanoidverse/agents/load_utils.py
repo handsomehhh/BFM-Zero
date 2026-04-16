@@ -43,4 +43,5 @@ def load_model_from_checkpoint_dir(checkpoint_dir: str, device: str = "cpu") -> 
     if model_name not in MODEL_NAME_TO_CLASS:
         raise ValueError(f"Unknown model name: {model_name}. Available: {list(MODEL_NAME_TO_CLASS.keys())}")
     model = MODEL_NAME_TO_CLASS[model_name].load(checkpoint_dir / "model", device=device)
+    import ipdb; ipdb.set_trace()
     return model

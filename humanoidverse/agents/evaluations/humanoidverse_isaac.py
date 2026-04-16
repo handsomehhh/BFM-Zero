@@ -12,6 +12,7 @@ import copy
 
 import mujoco
 import numpy as np
+import numpy.testing  # Force-load the venv NumPy testing module before Isaac mutates import paths.
 import ot
 import torch
 from torch.utils._pytree import tree_map
@@ -585,8 +586,8 @@ def distance_proximity(next_obs: torch.Tensor, tracking_target: torch.Tensor, bo
 
 def _calc_metrics(ep):
     metr = {}
-    next_obs = torch.tensor(ep["observation"]["state"][:, :QVEL_IDX], dtype=torch.float32)
-    tracking_target = torch.tensor(ep["tracking_target"]["state"][:, :QVEL_IDX], dtype=torch.float32)
+    next_obs = torch.as_tensor(ep["observation"]["state"][:, :QVEL_IDX], dtype=torch.float32)
+    tracking_target = torch.as_tensor(ep["tracking_target"]["state"][:, :QVEL_IDX], dtype=torch.float32)
     dist_prox_res = distance_proximity(next_obs=next_obs, tracking_target=tracking_target, prefix="obs_state_")
     metr.update(dist_prox_res)
     emd_res = emd_numpy(next_obs=next_obs, tracking_target=tracking_target, prefix="obs_state_")

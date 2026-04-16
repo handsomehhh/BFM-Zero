@@ -72,6 +72,17 @@ uv sync
 - **Motion data**: Included via Git LFS in `humanoidverse/data/` after `git lfs pull`. `lafan_29dof.pkl` is for evaluation; `lafan_29dof_10s-clipped.pkl` is for training.
 - If you are unsure about the data format, please check the discussion in
   [Issue #12](https://github.com/LeCAR-Lab/BFM-Zero/issues/12).
+- To merge an Isaac Lab `.npz` motion tree into one `.pkl`, run:
+
+```bash
+uv run python -m humanoidverse.merge_npz_to_pkl \
+    /home/lxz/Downloads/MotionTracking_Dataset/G1-Isaac-lab-format-npz-datasets \
+    /path/to/output/merged_dataset.pkl
+```
+
+- Key rule for merged entries:
+  regular `.npz` files use their relative path without `.npz`;
+  if a directory contains only one file named `motion.npz`, the key uses that directory's relative path instead.
 
 
 ## Training
@@ -261,4 +272,3 @@ Wrong arXiv id here!!
 ## Contact
 
 If you have any problems, please contact [liyitang475@gmail.com](mailto:liyitang475@gmail.com).
-

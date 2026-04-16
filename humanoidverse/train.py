@@ -188,13 +188,17 @@ def init_wandb(cfg: TrainConfig):
 class Workspace:
     def __init__(self, cfg: TrainConfig) -> None:
         self.cfg = cfg
+        print(f"Workdir: {self.cfg.work_dir}")
+        self.work_dir = Path(self.cfg.work_dir)
+        self.work_dir.mkdir(exist_ok=True, parents=True)
 
         # HACK with Isaac, we can not recreate environments with current code, so we need to
         #      create the environment with desired number of envs here
         if isinstance(cfg.env, HumanoidVerseIsaacConfig):
             from omegaconf import OmegaConf
 
-            self.train_env, self.train_env_info = cfg.env.build(num_envs=cfg.online_parallel_envs)
+            env_cfg = cfg.env.model_copy(update={"motion_scan_report_path": str(self.work_dir / "skipped_npz_files.json")})
+            self.train_env, self.train_env_info = env_cfg.build(num_envs=cfg.online_parallel_envs)
             self.obs_space = self.train_env.single_observation_space
             self.action_space = self.train_env.single_action_space
         else:
@@ -209,10 +213,6 @@ class Workspace:
         del self.obs_space.spaces["time"]
 
         self.action_dim = self.action_space.shape[0]
-
-        print(f"Workdir: {self.cfg.work_dir}")
-        self.work_dir = Path(self.cfg.work_dir)
-        self.work_dir.mkdir(exist_ok=True, parents=True)
 
         if isinstance(cfg.env, HumanoidVerseIsaacConfig):
             with open(self.work_dir / "config.yaml", "w") as file:
@@ -584,7 +584,7 @@ class Workspace:
             json.dump({"time": time}, f, indent=4)
 
 
-def train_bfm_zero():
+def train_bfm_zero(motion_root: str | None = None):
     from humanoidverse.agents.fb_cpr_aux.model import FBcprAuxModelArchiConfig, FBcprAuxModelConfig
     from humanoidverse.agents.fb_cpr_aux.agent import FBcprAuxAgentTrainConfig
     from humanoidverse.agents.nn_models import ForwardArchiConfig, BackwardArchiConfig, ActorArchiConfig, DiscriminatorArchiConfig, RewardNormalizerConfig
@@ -673,6 +673,7 @@ def train_bfm_zero():
             device='cuda:0',
             # TODO this needs to be updated to point to a path with lafan dataset chunked into 10s clips
             lafan_tail_path='humanoidverse/data/lafan_29dof_10s-clipped.pkl',
+            motion_root=motion_root,
             enable_cameras=False,
             camera_render_save_dir='isaac_videos',
             max_episode_length_s=None,
@@ -721,9 +722,11 @@ def train_bfm_zero():
     workspace.train()
 
 
+def main(motion_root: str | None = None) -> None:
+    train_bfm_zero(motion_root=motion_root)
+
+
 if __name__ == "__main__":
-    # This is the bare minimum CLI interface to launch experiments, but ideally you should
-    # launch your experiments from Python code (e.g., see under "scripts")
-    train_bfm_zero()
+    tyro.cli(main)
 
 # uv run --no-cache -m humanoidverse.meta_online_entry_point

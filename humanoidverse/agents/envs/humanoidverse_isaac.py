@@ -5,6 +5,7 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
 import typing as tp
 from typing import Any, Dict, Tuple, Union
+from pathlib import Path
 
 import gymnasium
 import humanoidverse
@@ -572,6 +573,8 @@ class HumanoidVerseIsaacConfig(BaseConfig):
     device: str = "cuda:0"
 
     lafan_tail_path: str
+    motion_root: str | None = None
+    motion_scan_report_path: str | None = None
 
     enable_cameras: bool = False
     camera_render_save_dir: str = "isaac_videos"
@@ -639,12 +642,18 @@ class HumanoidVerseIsaacConfig(BaseConfig):
         cfg.env.config.save_rendering_dir = self.camera_render_save_dir
         cfg.robot.asset.asset_root = cfg.robot.asset.asset_root.replace("humanoidverse", HUMANOIDVERSE_DIR)
         cfg.robot.motion.asset.assetRoot = cfg.robot.motion.asset.assetRoot.replace("humanoidverse", HUMANOIDVERSE_DIR)
-        cfg.robot.motion.motion_file = self.lafan_tail_path
+        motion_source = self.motion_root if self.motion_root is not None else self.lafan_tail_path
+        if self.motion_root is not None:
+            motion_source = str(Path(self.motion_root).expanduser().resolve())
+        cfg.robot.motion.motion_file = motion_source
 
         # This sets obs/action dims etc
         pre_process_config(cfg)
 
         OmegaConf.set_struct(cfg, False)
+        cfg.robot.motion.force_recursive_npz = self.motion_root is not None
+        if self.motion_scan_report_path is not None:
+            cfg.robot.motion.skipped_motion_report_path = str(Path(self.motion_scan_report_path).expanduser())
 
         if self.make_config_g1env_compatible:
             cfg.robot.motion.num_extend_bodies = 0

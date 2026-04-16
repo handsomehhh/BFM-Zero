@@ -15,6 +15,7 @@ dependencies = [
     "huggingface-hub>=0.30.2",
     "humenv",
     "hydra-core>=1.2.0",
+    "ipdb>=0.13.13",
     "isaaclab[all,isaacsim]==2.0.2; sys_platform == 'linux'",
     "isaacsim[all,extscache]==4.5.0; sys_platform == 'linux'",
     "joblib>=1.4.2",

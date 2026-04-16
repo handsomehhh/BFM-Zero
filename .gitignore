@@ -1,0 +1,7 @@
+results/
+.codex/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/

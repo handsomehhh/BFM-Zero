@@ -1,4 +1,5 @@
 import glob
+import json
 import os.path as osp
 import numpy as np
 import joblib
@@ -7,6 +8,7 @@ import torch.multiprocessing as mp
 import random
 
 from enum import Enum
+from humanoidverse.merge_npz_to_pkl import EXPECTED_FIELD_SET, collect_keys, discover_npz_files
 from humanoidverse.utils.motion_lib.skeleton import SkeletonTree
 from pathlib import Path
 from easydict import EasyDict
@@ -26,7 +28,8 @@ from humanoidverse.utils.torch_utils import(
     quat_to_angle_axis,
     quat_mul,
     quat_conjugate,
-    calc_heading_quat_inv
+    calc_heading_quat_inv,
+    my_quat_rotate,
 )
 
 class FixHeightMode(Enum):
@@ -37,6 +40,11 @@ class FixHeightMode(Enum):
 class MotionlibMode(Enum):
     file = 1
     directory = 2
+    npz = 3
+
+
+NPZ_EXPECTED_NUM_DOFS = 29
+NPZ_EXPECTED_NUM_BODIES = 30
 
 
 def to_torch(tensor):
@@ -44,6 +52,116 @@ def to_torch(tensor):
         return tensor
     else:
         return torch.from_numpy(tensor)
+
+
+def _fps_to_int(fps_value) -> int:
+    fps_array = np.asarray(fps_value)
+    if fps_array.size != 1:
+        raise ValueError(f"fps must contain exactly one value, got shape {fps_array.shape}")
+    fps = int(fps_array.reshape(-1)[0])
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, got {fps}")
+    return fps
+
+
+def validate_isaaclab_npz_motion(
+    npz_path: Path,
+    expected_num_dofs: int = NPZ_EXPECTED_NUM_DOFS,
+    expected_num_bodies: int = NPZ_EXPECTED_NUM_BODIES,
+) -> tuple[bool, str | None]:
+    try:
+        with np.load(npz_path, allow_pickle=False) as data:
+            actual_fields = frozenset(data.files)
+            if actual_fields != EXPECTED_FIELD_SET:
+                raise ValueError(
+                    f"unexpected fields: expected {sorted(EXPECTED_FIELD_SET)}, got {sorted(actual_fields)}"
+                )
+
+            fps = _fps_to_int(data["fps"])
+            joint_pos = data["joint_pos"]
+            joint_vel = data["joint_vel"]
+            body_pos = data["body_pos_w"]
+            body_quat = data["body_quat_w"]
+            body_lin_vel = data["body_lin_vel_w"]
+            body_ang_vel = data["body_ang_vel_w"]
+
+            if joint_pos.ndim != 2 or joint_pos.shape[1] != expected_num_dofs:
+                raise ValueError(
+                    f"joint_pos must have shape (T, {expected_num_dofs}), got {joint_pos.shape}"
+                )
+            if joint_vel.shape != joint_pos.shape:
+                raise ValueError(f"joint_vel must match joint_pos shape {joint_pos.shape}, got {joint_vel.shape}")
+
+            expected_vec_shape = (joint_pos.shape[0], expected_num_bodies, 3)
+            expected_quat_shape = (joint_pos.shape[0], expected_num_bodies, 4)
+            if body_pos.shape != expected_vec_shape:
+                raise ValueError(f"body_pos_w must have shape {expected_vec_shape}, got {body_pos.shape}")
+            if body_lin_vel.shape != expected_vec_shape:
+                raise ValueError(f"body_lin_vel_w must have shape {expected_vec_shape}, got {body_lin_vel.shape}")
+            if body_ang_vel.shape != expected_vec_shape:
+                raise ValueError(f"body_ang_vel_w must have shape {expected_vec_shape}, got {body_ang_vel.shape}")
+            if body_quat.shape != expected_quat_shape:
+                raise ValueError(f"body_quat_w must have shape {expected_quat_shape}, got {body_quat.shape}")
+            if joint_pos.shape[0] < 2:
+                raise ValueError("motion must contain at least 2 frames")
+            _ = fps
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    return True, None
+
+
+def discover_valid_isaaclab_npz_motions(
+    input_root: Path | str,
+    expected_num_dofs: int = NPZ_EXPECTED_NUM_DOFS,
+    expected_num_bodies: int = NPZ_EXPECTED_NUM_BODIES,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, str]]]:
+    input_root = Path(input_root).expanduser().resolve()
+    npz_paths, directory_npz_counts = discover_npz_files(input_root=input_root)
+    valid_paths: list[Path] = []
+    skipped_files: list[dict[str, str]] = []
+    print(f"Discovered {len(npz_paths)} .npz files under {input_root} (including {sum(directory_npz_counts.values())} in directories)")
+    i = 0
+    for npz_path in npz_paths:
+        if i % 1000 == 0:
+            print(i)
+        i += 1
+        is_valid, error_message = validate_isaaclab_npz_motion(
+            npz_path=npz_path,
+            expected_num_dofs=expected_num_dofs,
+            expected_num_bodies=expected_num_bodies,
+        )
+        if is_valid:
+            valid_paths.append(npz_path)
+        else:
+            skipped_files.append({"path": str(npz_path.resolve()), "reason": error_message or "unknown validation error"})
+
+    if not valid_paths:
+        raise ValueError(f"No valid .npz motion files found under {input_root}")
+
+    keys_by_path = collect_keys(
+        npz_paths=valid_paths,
+        input_root=input_root,
+        directory_npz_counts=directory_npz_counts,
+    )
+    ordered_keys = np.array([keys_by_path[path] for path in valid_paths])
+    return np.array(valid_paths, dtype=object), ordered_keys, skipped_files
+
+
+def write_skipped_motion_report(
+    report_path: Path | str,
+    motion_root: Path | str,
+    valid_motion_count: int,
+    skipped_files: list[dict[str, str]],
+) -> None:
+    payload = {
+        "motion_root": str(Path(motion_root).expanduser().resolve()),
+        "num_valid": valid_motion_count,
+        "num_skipped": len(skipped_files),
+        "skipped_files": sorted(skipped_files, key=lambda item: item["path"]),
+    }
+    report_path = Path(report_path).expanduser()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 class MotionLibBase():
     def __init__(self, motion_lib_cfg, num_envs, device):
@@ -55,6 +173,7 @@ class MotionLibBase():
         self._device = device
         self.mesh_parsers = None
         self.has_action = False
+        self._skipped_motion_files: list[dict[str, str]] = []
         skeleton_file = Path(self.m_cfg.asset.assetRoot) / self.m_cfg.asset.assetFileName
         self.skeleton_tree = SkeletonTree.from_mjcf(skeleton_file)
         logger.info(f"Loaded skeleton from {skeleton_file}")
@@ -70,13 +189,49 @@ class MotionLibBase():
         return
         
     def load_data(self, motion_file, min_length=-1, im_eval = False):
+        motion_path = Path(motion_file).expanduser()
+        force_recursive_npz = bool(self.m_cfg.get("force_recursive_npz", False))
         if osp.isfile(motion_file):
-            self.mode = MotionlibMode.file
-            self._motion_data_load = joblib.load(motion_file)
+            if motion_path.suffix == ".npz":
+                is_valid, error_message = validate_isaaclab_npz_motion(motion_path.resolve())
+                if not is_valid:
+                    raise ValueError(f"Invalid Isaac Lab npz motion file {motion_path}: {error_message}")
+                self.mode = MotionlibMode.npz
+                self._motion_data_load = np.array([motion_path.resolve()], dtype=object)
+                self._motion_data_list = self._motion_data_load
+                if motion_path.name == "motion.npz":
+                    motion_key = motion_path.parent.name
+                else:
+                    motion_key = motion_path.stem
+                self._motion_data_keys = np.array([motion_key])
+                self._skipped_motion_files = []
+            else:
+                self.mode = MotionlibMode.file
+                self._motion_data_load = joblib.load(motion_file)
         else:
-            self.mode = MotionlibMode.directory
-            self._motion_data_load = glob.glob(osp.join(motion_file, "*.pkl"))
-        
+            pkl_files = sorted(glob.glob(osp.join(motion_file, "*.pkl")))
+            if pkl_files and not force_recursive_npz:
+                self.mode = MotionlibMode.directory
+                self._motion_data_load = pkl_files
+            else:
+                self.mode = MotionlibMode.npz
+                self._motion_data_load, self._motion_data_keys, self._skipped_motion_files = discover_valid_isaaclab_npz_motions(
+                    motion_path
+                )
+                self._motion_data_list = self._motion_data_load
+                if self._skipped_motion_files:
+                    logger.warning(
+                        f"Skipped {len(self._skipped_motion_files)} invalid npz motion files while scanning {motion_path}"
+                    )
+                report_path = self.m_cfg.get("skipped_motion_report_path", None)
+                if report_path is not None:
+                    write_skipped_motion_report(
+                        report_path=report_path,
+                        motion_root=motion_path,
+                        valid_motion_count=len(self._motion_data_list),
+                        skipped_files=self._skipped_motion_files,
+                    )
+
         data_list = self._motion_data_load
         if self.mode == MotionlibMode.file:
             if min_length != -1:
@@ -89,7 +244,7 @@ class MotionLibBase():
                 data_list = self._motion_data_load
             self._motion_data_list = np.array(list(data_list.values()))
             self._motion_data_keys = np.array(list(data_list.keys()))
-        else:
+        elif self.mode == MotionlibMode.directory:
             self._motion_data_list = np.array(self._motion_data_load)
             self._motion_data_keys = np.array(self._motion_data_load)
         
@@ -333,9 +488,12 @@ class MotionLibBase():
                      target_heading = None, num_motions_to_load = None):
         
         if "gts" in self.__dict__:
-            del self.gts, self.grs, self.lrs, self.grvs, self.gravs, self.gavs, self.gvs, self.dvs, self.dof_pos
-            if "gts_t" in self.__dict__:
-                del self.gts_t, self.grs_t, self.gvs_t, self.gavs_t
+            for attr_name in ("gts", "grs", "lrs", "grvs", "gravs", "gavs", "gvs", "dvs", "dof_pos"):
+                if hasattr(self, attr_name):
+                    delattr(self, attr_name)
+            for attr_name in ("gts_t", "grs_t", "gvs_t", "gavs_t"):
+                if hasattr(self, attr_name):
+                    delattr(self, attr_name)
                 
         
         motions = []
@@ -372,34 +530,38 @@ class MotionLibBase():
         logger.info(f"Current motion keys: {self.curr_motion_keys[:10]}, ....")
 
         motion_data_list = self._motion_data_list[sample_idxes.cpu().numpy()]
-        if self.smpl_data is not None:
-            smpl_data_list = [self.smpl_data[idx] for idx in sample_idxes.cpu().numpy()]
-        else:
-            smpl_data_list = None
-        torch.set_num_threads(1)
-        manager = mp.Manager()
-        queue = manager.Queue()
-        num_jobs = min(mp.cpu_count(), 8)
-        
-        if num_jobs <= 16 or not self.multi_thread:
-            num_jobs = 1
         res_acc = {}  # using dictionary ensures order of the results.
-        jobs = motion_data_list
-        chunk = np.ceil(len(jobs) / num_jobs).astype(int)
-        ids = np.arange(len(jobs))
+        if self.mode == MotionlibMode.npz:
+            for motion_index, npz_path in enumerate(track(motion_data_list, description="Loading npz motions...")):
+                res_acc[motion_index] = self.load_motion_from_npz(Path(npz_path), target_heading=target_heading, max_len=max_len)
+        else:
+            if self.smpl_data is not None:
+                smpl_data_list = [self.smpl_data[idx] for idx in sample_idxes.cpu().numpy()]
+            else:
+                smpl_data_list = None
+            torch.set_num_threads(1)
+            manager = mp.Manager()
+            queue = manager.Queue()
+            num_jobs = min(mp.cpu_count(), 8)
+            
+            if num_jobs <= 16 or not self.multi_thread:
+                num_jobs = 1
+            jobs = motion_data_list
+            chunk = np.ceil(len(jobs) / num_jobs).astype(int)
+            ids = np.arange(len(jobs))
 
-        jobs = [(ids[i:i + chunk], jobs[i:i + chunk], smpl_data_list, self.fix_height, target_heading, max_len) for i in range(0, len(jobs), chunk)]
-        job_args = [jobs[i] for i in range(len(jobs))]
-        for i in range(1, len(jobs)):
-            worker_args = (*job_args[i], queue, i)
-            worker = mp.Process(target=self.load_motion_with_skeleton, args=worker_args)
-            worker.start()
-        res_acc.update(self.load_motion_with_skeleton(*jobs[0], None, 0))
-        
-        
-        for i in track(range(len(jobs) - 1), "Gathering results..."):
-            res = queue.get()
-            res_acc.update(res)
+            jobs = [(ids[i:i + chunk], jobs[i:i + chunk], smpl_data_list, self.fix_height, target_heading, max_len) for i in range(0, len(jobs), chunk)]
+            job_args = [jobs[i] for i in range(len(jobs))]
+            for i in range(1, len(jobs)):
+                worker_args = (*job_args[i], queue, i)
+                worker = mp.Process(target=self.load_motion_with_skeleton, args=worker_args)
+                worker.start()
+            res_acc.update(self.load_motion_with_skeleton(*jobs[0], None, 0))
+            
+            
+            for i in track(range(len(jobs) - 1), "Gathering results..."):
+                res = queue.get()
+                res_acc.update(res)
 
         
         for f in track(range(len(res_acc)), description="Processing motions..."):
@@ -484,6 +646,91 @@ class MotionLibBase():
             trans[..., 2] -= height_diff
             
             return trans, height_diff
+
+    def load_motion_from_npz(self, npz_path: Path, target_heading=None, max_len: int = -1):
+        with np.load(npz_path, allow_pickle=False) as data:
+            body_pos = torch.from_numpy(np.array(data["body_pos_w"], copy=True)).float()
+            body_rot_wxyz = torch.from_numpy(np.array(data["body_quat_w"], copy=True)).float()
+            body_vel = torch.from_numpy(np.array(data["body_lin_vel_w"], copy=True)).float()
+            body_ang_vel = torch.from_numpy(np.array(data["body_ang_vel_w"], copy=True)).float()
+            dof_pos = torch.from_numpy(np.array(data["joint_pos"], copy=True)).float()
+            dof_vel = torch.from_numpy(np.array(data["joint_vel"], copy=True)).float()
+            fps = _fps_to_int(data["fps"])
+
+        seq_len = body_pos.shape[0]
+        if max_len == -1 or seq_len < max_len:
+            start, end = 0, seq_len
+        else:
+            start = random.randint(0, seq_len - max_len)
+            end = start + max_len
+
+        body_pos = body_pos[start:end]
+        body_rot = body_rot_wxyz[start:end][..., [1, 2, 3, 0]]
+        body_rot = body_rot / body_rot.norm(dim=-1, keepdim=True).clamp(min=1e-9)
+        body_vel = body_vel[start:end]
+        body_ang_vel = body_ang_vel[start:end]
+        dof_pos = dof_pos[start:end]
+        dof_vel = dof_vel[start:end]
+
+        if target_heading is not None:
+            target_heading = torch.as_tensor(target_heading, dtype=body_rot.dtype).reshape(1, 4)
+            start_root_rot = body_rot[0, 0].reshape(1, 4)
+            heading_delta = quat_mul(target_heading, calc_heading_quat_inv(start_root_rot, w_last=True), w_last=True)
+            delta_expand = heading_delta.expand(body_pos.shape[0], -1)
+            body_pos = my_quat_rotate(delta_expand.repeat_interleave(body_pos.shape[1], dim=0), body_pos.reshape(-1, 3)).view_as(body_pos)
+            body_vel = my_quat_rotate(delta_expand.repeat_interleave(body_vel.shape[1], dim=0), body_vel.reshape(-1, 3)).view_as(body_vel)
+            body_ang_vel = my_quat_rotate(delta_expand.repeat_interleave(body_ang_vel.shape[1], dim=0), body_ang_vel.reshape(-1, 3)).view_as(body_ang_vel)
+            body_rot = quat_mul(
+                delta_expand.repeat_interleave(body_rot.shape[1], dim=0),
+                body_rot.reshape(-1, 4),
+                w_last=True,
+            ).view_as(body_rot)
+
+        motion_dict = EasyDict(
+            global_translation=body_pos,
+            global_rotation=body_rot,
+            local_rotation=body_rot.clone(),
+            global_root_velocity=body_vel[:, 0].clone(),
+            global_root_angular_velocity=body_ang_vel[:, 0].clone(),
+            global_velocity=body_vel,
+            global_angular_velocity=body_ang_vel,
+            dof_pos=dof_pos,
+            dof_vels=dof_vel,
+            fps=fps,
+        )
+
+        extend_config = self.m_cfg.get("extend_config", [])
+        if len(extend_config) > 0:
+            extend_positions, extend_rotations, extend_velocities, extend_ang_velocities = [], [], [], []
+            for extend_cfg in extend_config:
+                parent_name = extend_cfg["parent_name"]
+                parent_idx = self.skeleton_tree.node_names.index(parent_name)
+                parent_rot = body_rot[:, parent_idx]
+                parent_pos = body_pos[:, parent_idx]
+                parent_vel = body_vel[:, parent_idx]
+                parent_ang_vel = body_ang_vel[:, parent_idx]
+
+                offset_local = torch.tensor(extend_cfg["pos"], dtype=body_pos.dtype).unsqueeze(0).repeat(body_pos.shape[0], 1)
+                extend_rot_wxyz = torch.tensor(extend_cfg["rot"], dtype=body_pos.dtype)
+                extend_rot_xyzw = extend_rot_wxyz[[1, 2, 3, 0]].unsqueeze(0).repeat(body_pos.shape[0], 1)
+
+                rotated_pos_in_parent = my_quat_rotate(parent_rot, offset_local)
+                extend_pos = my_quat_rotate(extend_rot_xyzw, rotated_pos_in_parent) + parent_pos
+                extend_rot = quat_mul(parent_rot, extend_rot_xyzw, w_last=True)
+                extend_vel = parent_vel + torch.cross(parent_ang_vel, offset_local, dim=-1)
+                extend_ang_vel = parent_ang_vel
+
+                extend_positions.append(extend_pos)
+                extend_rotations.append(extend_rot)
+                extend_velocities.append(extend_vel)
+                extend_ang_velocities.append(extend_ang_vel)
+
+            motion_dict.global_translation_extend = torch.cat([body_pos, torch.stack(extend_positions, dim=1)], dim=1)
+            motion_dict.global_rotation_extend = torch.cat([body_rot, torch.stack(extend_rotations, dim=1)], dim=1)
+            motion_dict.global_velocity_extend = torch.cat([body_vel, torch.stack(extend_velocities, dim=1)], dim=1)
+            motion_dict.global_angular_velocity_extend = torch.cat([body_ang_vel, torch.stack(extend_ang_velocities, dim=1)], dim=1)
+
+        return {}, motion_dict
 
     def load_motion_with_skeleton(self,
                                   ids, 
