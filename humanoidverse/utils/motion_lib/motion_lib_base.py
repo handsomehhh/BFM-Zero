@@ -1,6 +1,7 @@
 import glob
 import json
 import os.path as osp
+from collections import defaultdict
 import numpy as np
 import joblib
 import torch
@@ -64,6 +65,48 @@ def _fps_to_int(fps_value) -> int:
     return fps
 
 
+def _normalize_motion_roots(input_root: Path | str | list[str] | tuple[str, ...]) -> list[Path]:
+    if isinstance(input_root, (str, Path)):
+        roots = [input_root]
+    elif isinstance(input_root, (list, tuple)):
+        roots = list(input_root)
+    else:
+        raise TypeError(f"Unsupported motion root type: {type(input_root)!r}")
+
+    if len(roots) == 0:
+        raise ValueError("motion_root must contain at least one directory")
+
+    resolved_roots: list[Path] = []
+    for root in roots:
+        root_path = Path(root).expanduser().resolve()
+        if not root_path.exists():
+            raise FileNotFoundError(f"Motion root does not exist: {root_path}")
+        if not root_path.is_dir():
+            raise ValueError(f"Motion root must be a directory when scanning npz motions: {root_path}")
+        resolved_roots.append(root_path)
+    return resolved_roots
+
+
+def _build_motion_root_prefixes(input_roots: list[Path]) -> dict[Path, str]:
+    if len(input_roots) <= 1:
+        return {root: "" for root in input_roots}
+
+    basename_counts: dict[str, int] = defaultdict(int)
+    for root in input_roots:
+        basename = root.name or root.as_posix().strip("/").replace("/", "_")
+        basename_counts[basename] += 1
+
+    prefix_counts: dict[str, int] = defaultdict(int)
+    prefixes: dict[Path, str] = {}
+    for root in input_roots:
+        basename = root.name or root.as_posix().strip("/").replace("/", "_")
+        prefix_base = basename if basename_counts[basename] == 1 else root.as_posix().strip("/").replace("/", "_")
+        prefix_counts[prefix_base] += 1
+        prefix = prefix_base if prefix_counts[prefix_base] == 1 else f"{prefix_base}#{prefix_counts[prefix_base]}"
+        prefixes[root] = prefix
+    return prefixes
+
+
 def validate_isaaclab_npz_motion(
     npz_path: Path,
     expected_num_dofs: int = NPZ_EXPECTED_NUM_DOFS,
@@ -111,54 +154,74 @@ def validate_isaaclab_npz_motion(
 
 
 def discover_valid_isaaclab_npz_motions(
-    input_root: Path | str,
+    input_root: Path | str | list[str] | tuple[str, ...],
     expected_num_dofs: int = NPZ_EXPECTED_NUM_DOFS,
     expected_num_bodies: int = NPZ_EXPECTED_NUM_BODIES,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, str]]]:
-    input_root = Path(input_root).expanduser().resolve()
-    npz_paths, directory_npz_counts = discover_npz_files(input_root=input_root)
+    input_roots = _normalize_motion_roots(input_root)
+    root_prefixes = _build_motion_root_prefixes(input_roots)
+
     valid_paths: list[Path] = []
+    ordered_keys: list[str] = []
     skipped_files: list[dict[str, str]] = []
-    print(f"Discovered {len(npz_paths)} .npz files under {input_root} (including {sum(directory_npz_counts.values())} in directories)")
-    i = 0
-    for npz_path in npz_paths:
-        if i % 1000 == 0:
-            print(i)
-        i += 1
-        is_valid, error_message = validate_isaaclab_npz_motion(
-            npz_path=npz_path,
-            expected_num_dofs=expected_num_dofs,
-            expected_num_bodies=expected_num_bodies,
+    for input_root in input_roots:
+        npz_paths, directory_npz_counts = discover_npz_files(input_root=input_root)
+        print(f"Discovered {len(npz_paths)} .npz files under {input_root} (including {sum(directory_npz_counts.values())} in directories)")
+        root_valid_paths: list[Path] = []
+        for i, npz_path in enumerate(npz_paths):
+            if i % 1000 == 0:
+                print(i)
+            is_valid, error_message = validate_isaaclab_npz_motion(
+                npz_path=npz_path,
+                expected_num_dofs=expected_num_dofs,
+                expected_num_bodies=expected_num_bodies,
+            )
+            if is_valid:
+                root_valid_paths.append(npz_path)
+            else:
+                skipped_files.append({"path": str(npz_path.resolve()), "reason": error_message or "unknown validation error"})
+
+        if not root_valid_paths:
+            continue
+
+        keys_by_path = collect_keys(
+            npz_paths=root_valid_paths,
+            input_root=input_root,
+            directory_npz_counts=directory_npz_counts,
         )
-        if is_valid:
-            valid_paths.append(npz_path)
-        else:
-            skipped_files.append({"path": str(npz_path.resolve()), "reason": error_message or "unknown validation error"})
+        root_prefix = root_prefixes[input_root]
+        for path in root_valid_paths:
+            key = keys_by_path[path]
+            if root_prefix:
+                key = f"{root_prefix}/{key}"
+            valid_paths.append(path)
+            ordered_keys.append(key)
 
     if not valid_paths:
-        raise ValueError(f"No valid .npz motion files found under {input_root}")
+        formatted_roots = ", ".join(str(root) for root in input_roots)
+        raise ValueError(f"No valid .npz motion files found under: {formatted_roots}")
 
-    keys_by_path = collect_keys(
-        npz_paths=valid_paths,
-        input_root=input_root,
-        directory_npz_counts=directory_npz_counts,
-    )
-    ordered_keys = np.array([keys_by_path[path] for path in valid_paths])
-    return np.array(valid_paths, dtype=object), ordered_keys, skipped_files
+    if len(set(ordered_keys)) != len(ordered_keys):
+        raise ValueError("Discovered duplicate motion keys while scanning motion roots; please rename conflicting directories/files")
+
+    return np.array(valid_paths, dtype=object), np.array(ordered_keys), skipped_files
 
 
 def write_skipped_motion_report(
     report_path: Path | str,
-    motion_root: Path | str,
+    motion_root: Path | str | list[str] | tuple[str, ...],
     valid_motion_count: int,
     skipped_files: list[dict[str, str]],
 ) -> None:
+    motion_roots = _normalize_motion_roots(motion_root)
     payload = {
-        "motion_root": str(Path(motion_root).expanduser().resolve()),
+        "motion_roots": [str(root) for root in motion_roots],
         "num_valid": valid_motion_count,
         "num_skipped": len(skipped_files),
         "skipped_files": sorted(skipped_files, key=lambda item: item["path"]),
     }
+    if len(motion_roots) == 1:
+        payload["motion_root"] = str(motion_roots[0])
     report_path = Path(report_path).expanduser()
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -189,8 +252,30 @@ class MotionLibBase():
         return
         
     def load_data(self, motion_file, min_length=-1, im_eval = False):
-        motion_path = Path(motion_file).expanduser()
         force_recursive_npz = bool(self.m_cfg.get("force_recursive_npz", False))
+        if isinstance(motion_file, (list, tuple)):
+            self.mode = MotionlibMode.npz
+            self._motion_data_load, self._motion_data_keys, self._skipped_motion_files = discover_valid_isaaclab_npz_motions(
+                motion_file
+            )
+            self._motion_data_list = self._motion_data_load
+            if self._skipped_motion_files:
+                logger.warning(
+                    f"Skipped {len(self._skipped_motion_files)} invalid npz motion files while scanning motion roots {motion_file}"
+                )
+            report_path = self.m_cfg.get("skipped_motion_report_path", None)
+            if report_path is not None:
+                write_skipped_motion_report(
+                    report_path=report_path,
+                    motion_root=motion_file,
+                    valid_motion_count=len(self._motion_data_list),
+                    skipped_files=self._skipped_motion_files,
+                )
+            self._num_unique_motions = len(self._motion_data_list)
+            logger.info(f"Loaded {self._num_unique_motions} motions")
+            return
+
+        motion_path = Path(motion_file).expanduser()
         if osp.isfile(motion_file):
             if motion_path.suffix == ".npz":
                 is_valid, error_message = validate_isaaclab_npz_motion(motion_path.resolve())

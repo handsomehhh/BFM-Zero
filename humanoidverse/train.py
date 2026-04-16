@@ -584,7 +584,7 @@ class Workspace:
             json.dump({"time": time}, f, indent=4)
 
 
-def train_bfm_zero(motion_root: str | None = None):
+def train_bfm_zero(motion_root: list[str] | None = None):
     from humanoidverse.agents.fb_cpr_aux.model import FBcprAuxModelArchiConfig, FBcprAuxModelConfig
     from humanoidverse.agents.fb_cpr_aux.agent import FBcprAuxAgentTrainConfig
     from humanoidverse.agents.nn_models import ForwardArchiConfig, BackwardArchiConfig, ActorArchiConfig, DiscriminatorArchiConfig, RewardNormalizerConfig
@@ -722,7 +722,7 @@ def train_bfm_zero(motion_root: str | None = None):
     workspace.train()
 
 
-def main(motion_root: str | None = None) -> None:
+def main(motion_root: list[str] | None = None) -> None:
     train_bfm_zero(motion_root=motion_root)
 
 

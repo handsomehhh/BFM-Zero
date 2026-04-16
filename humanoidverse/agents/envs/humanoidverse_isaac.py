@@ -573,7 +573,7 @@ class HumanoidVerseIsaacConfig(BaseConfig):
     device: str = "cuda:0"
 
     lafan_tail_path: str
-    motion_root: str | None = None
+    motion_root: tp.List[str] | None = None
     motion_scan_report_path: str | None = None
 
     enable_cameras: bool = False
@@ -642,9 +642,10 @@ class HumanoidVerseIsaacConfig(BaseConfig):
         cfg.env.config.save_rendering_dir = self.camera_render_save_dir
         cfg.robot.asset.asset_root = cfg.robot.asset.asset_root.replace("humanoidverse", HUMANOIDVERSE_DIR)
         cfg.robot.motion.asset.assetRoot = cfg.robot.motion.asset.assetRoot.replace("humanoidverse", HUMANOIDVERSE_DIR)
-        motion_source = self.motion_root if self.motion_root is not None else self.lafan_tail_path
+        motion_source: str | tp.List[str] = self.lafan_tail_path
         if self.motion_root is not None:
-            motion_source = str(Path(self.motion_root).expanduser().resolve())
+            resolved_motion_roots = [str(Path(root).expanduser().resolve()) for root in self.motion_root]
+            motion_source = resolved_motion_roots[0] if len(resolved_motion_roots) == 1 else resolved_motion_roots
         cfg.robot.motion.motion_file = motion_source
 
         # This sets obs/action dims etc
