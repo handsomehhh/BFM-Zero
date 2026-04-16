@@ -1,6 +1,7 @@
 import glob
 import json
 import os.path as osp
+from collections.abc import Sequence
 from collections import defaultdict
 import numpy as np
 import joblib
@@ -14,6 +15,7 @@ from humanoidverse.utils.motion_lib.skeleton import SkeletonTree
 from pathlib import Path
 from easydict import EasyDict
 from loguru import logger
+from omegaconf import ListConfig
 from rich.progress import track
 from scipy.spatial.transform import Rotation as sRot
 import gc
@@ -65,10 +67,16 @@ def _fps_to_int(fps_value) -> int:
     return fps
 
 
+def _is_motion_root_collection(value) -> bool:
+    return isinstance(value, (list, tuple, ListConfig)) or (
+        isinstance(value, Sequence) and not isinstance(value, (str, bytes, Path))
+    )
+
+
 def _normalize_motion_roots(input_root: Path | str | list[str] | tuple[str, ...]) -> list[Path]:
     if isinstance(input_root, (str, Path)):
         roots = [input_root]
-    elif isinstance(input_root, (list, tuple)):
+    elif _is_motion_root_collection(input_root):
         roots = list(input_root)
     else:
         raise TypeError(f"Unsupported motion root type: {type(input_root)!r}")
@@ -253,7 +261,7 @@ class MotionLibBase():
         
     def load_data(self, motion_file, min_length=-1, im_eval = False):
         force_recursive_npz = bool(self.m_cfg.get("force_recursive_npz", False))
-        if isinstance(motion_file, (list, tuple)):
+        if _is_motion_root_collection(motion_file):
             self.mode = MotionlibMode.npz
             self._motion_data_load, self._motion_data_keys, self._skipped_motion_files = discover_valid_isaaclab_npz_motions(
                 motion_file
