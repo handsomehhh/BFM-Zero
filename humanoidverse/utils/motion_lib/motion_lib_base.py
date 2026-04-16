@@ -205,14 +205,20 @@ def discover_valid_isaaclab_npz_motions(
             valid_paths.append(path)
             ordered_keys.append(key)
 
-    if not valid_paths:
-        formatted_roots = ", ".join(str(root) for root in input_roots)
-        raise ValueError(f"No valid .npz motion files found under: {formatted_roots}")
-
     if len(set(ordered_keys)) != len(ordered_keys):
         raise ValueError("Discovered duplicate motion keys while scanning motion roots; please rename conflicting directories/files")
 
     return np.array(valid_paths, dtype=object), np.array(ordered_keys), skipped_files
+
+
+def write_skipped_motion_paths(paths_path: Path | str, skipped_files: list[dict[str, str]]) -> None:
+    paths_path = Path(paths_path).expanduser()
+    paths_path.parent.mkdir(parents=True, exist_ok=True)
+    sorted_paths = sorted(item["path"] for item in skipped_files)
+    content = "\n".join(sorted_paths)
+    if content:
+        content += "\n"
+    paths_path.write_text(content, encoding="utf-8")
 
 
 def write_skipped_motion_report(
@@ -222,17 +228,26 @@ def write_skipped_motion_report(
     skipped_files: list[dict[str, str]],
 ) -> None:
     motion_roots = _normalize_motion_roots(motion_root)
+    report_path = Path(report_path).expanduser()
+    invalid_paths_path = report_path.with_name(f"{report_path.stem}_paths.txt")
     payload = {
         "motion_roots": [str(root) for root in motion_roots],
         "num_valid": valid_motion_count,
         "num_skipped": len(skipped_files),
+        "invalid_paths_file": str(invalid_paths_path),
         "skipped_files": sorted(skipped_files, key=lambda item: item["path"]),
     }
     if len(motion_roots) == 1:
         payload["motion_root"] = str(motion_roots[0])
-    report_path = Path(report_path).expanduser()
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_skipped_motion_paths(invalid_paths_path, skipped_files)
+
+
+def _raise_no_valid_npz_motions(motion_root: Path | str | list[str] | tuple[str, ...]) -> None:
+    motion_roots = _normalize_motion_roots(motion_root)
+    formatted_roots = ", ".join(str(root) for root in motion_roots)
+    raise ValueError(f"No valid .npz motion files found under: {formatted_roots}")
 
 class MotionLibBase():
     def __init__(self, motion_lib_cfg, num_envs, device):
@@ -267,10 +282,6 @@ class MotionLibBase():
                 motion_file
             )
             self._motion_data_list = self._motion_data_load
-            if self._skipped_motion_files:
-                logger.warning(
-                    f"Skipped {len(self._skipped_motion_files)} invalid npz motion files while scanning motion roots {motion_file}"
-                )
             report_path = self.m_cfg.get("skipped_motion_report_path", None)
             if report_path is not None:
                 write_skipped_motion_report(
@@ -278,6 +289,12 @@ class MotionLibBase():
                     motion_root=motion_file,
                     valid_motion_count=len(self._motion_data_list),
                     skipped_files=self._skipped_motion_files,
+                )
+            if len(self._motion_data_list) == 0:
+                _raise_no_valid_npz_motions(motion_file)
+            if self._skipped_motion_files:
+                logger.warning(
+                    f"Skipped {len(self._skipped_motion_files)} invalid npz motion files while scanning motion roots {motion_file}"
                 )
             self._num_unique_motions = len(self._motion_data_list)
             logger.info(f"Loaded {self._num_unique_motions} motions")
@@ -288,6 +305,15 @@ class MotionLibBase():
             if motion_path.suffix == ".npz":
                 is_valid, error_message = validate_isaaclab_npz_motion(motion_path.resolve())
                 if not is_valid:
+                    self._skipped_motion_files = [{"path": str(motion_path.resolve()), "reason": error_message or "unknown validation error"}]
+                    report_path = self.m_cfg.get("skipped_motion_report_path", None)
+                    if report_path is not None:
+                        write_skipped_motion_report(
+                            report_path=report_path,
+                            motion_root=motion_path.parent,
+                            valid_motion_count=0,
+                            skipped_files=self._skipped_motion_files,
+                        )
                     raise ValueError(f"Invalid Isaac Lab npz motion file {motion_path}: {error_message}")
                 self.mode = MotionlibMode.npz
                 self._motion_data_load = np.array([motion_path.resolve()], dtype=object)
@@ -312,10 +338,6 @@ class MotionLibBase():
                     motion_path
                 )
                 self._motion_data_list = self._motion_data_load
-                if self._skipped_motion_files:
-                    logger.warning(
-                        f"Skipped {len(self._skipped_motion_files)} invalid npz motion files while scanning {motion_path}"
-                    )
                 report_path = self.m_cfg.get("skipped_motion_report_path", None)
                 if report_path is not None:
                     write_skipped_motion_report(
@@ -323,6 +345,12 @@ class MotionLibBase():
                         motion_root=motion_path,
                         valid_motion_count=len(self._motion_data_list),
                         skipped_files=self._skipped_motion_files,
+                    )
+                if len(self._motion_data_list) == 0:
+                    _raise_no_valid_npz_motions(motion_path)
+                if self._skipped_motion_files:
+                    logger.warning(
+                        f"Skipped {len(self._skipped_motion_files)} invalid npz motion files while scanning {motion_path}"
                     )
 
         data_list = self._motion_data_load
